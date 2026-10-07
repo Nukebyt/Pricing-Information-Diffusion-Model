@@ -2,6 +2,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "data"))
 
 import reference_table
@@ -9,11 +11,11 @@ from reference_table import build_reference_table, build_subscribe_message
 
 
 def test_build_subscribe_message_shape():
-    raw = build_subscribe_message(["NSE_FO|C1", "NSE_INDEX|Nifty 50"], mode="full_d5")
+    raw = build_subscribe_message(["NSE_FO|C1", "NSE_INDEX|Nifty 50"], mode="full")
     assert isinstance(raw, bytes)
     parsed = json.loads(raw.decode("utf-8"))
     assert parsed["method"] == "sub"
-    assert parsed["data"]["mode"] == "full_d5"
+    assert parsed["data"]["mode"] == "full"
     assert parsed["data"]["instrumentKeys"] == ["NSE_FO|C1", "NSE_INDEX|Nifty 50"]
     assert "guid" in parsed
 
@@ -21,7 +23,14 @@ def test_build_subscribe_message_shape():
 def test_build_subscribe_message_default_mode():
     raw = build_subscribe_message(["NSE_FO|C1"])
     parsed = json.loads(raw.decode("utf-8"))
-    assert parsed["data"]["mode"] == "full_d5"
+    assert parsed["data"]["mode"] == "full"
+
+
+def test_build_subscribe_message_rejects_full_d5():
+    # BUG-3 regression: "full_d5" is the protobuf enum name, not a valid
+    # subscribe mode -- the server accepts it silently and sends no ticks.
+    with pytest.raises(ValueError):
+        build_subscribe_message(["NSE_FO|C1"], mode="full_d5")
 
 
 def _fake_contract(instrument_key, strike, instrument_type):

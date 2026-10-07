@@ -4,7 +4,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "diffusion"))
 
-from event_calendar import EVENTS, after_hours_events, market_hours_events, upcoming_events
+import pytest
+
+from event_calendar import EVENTS, IST, after_hours_events, get_event, market_hours_events, upcoming_events
 
 
 def test_all_events_have_timezone_aware_utc_timestamps():
@@ -43,9 +45,39 @@ def test_after_hours_events_is_cpi_only():
     assert all(e.market_hours_event is False for e in events)
 
 
-def test_cpi_events_marked_approximate_confidence():
+def test_cpi_confidence_is_minute_only_when_12th_is_a_working_day_or_confirmed():
     for e in after_hours_events():
-        assert e.timing_confidence == "approximate"
+        assert e.timing_confidence in {"minute", "approximate"}
+    # Dec 12, 2026 is a Saturday and the shift is unconfirmed -> approximate
+    assert get_event("CPI November 2026").timing_confidence == "approximate"
+    assert get_event("CPI September 2026").timing_confidence == "minute"
+
+
+def test_cpi_dates_match_mospi_calendar_and_weekday_rule():
+    # MoSPI schedules CPI on the 12th, moved to the next working day if the
+    # 12th is a weekend. Regression: the calendar once said 2026-10-13 for
+    # September data (MoSPI's calendar says Monday 2026-10-12).
+    expected_ist_dates = {
+        "CPI July 2026": (2026, 8, 12),
+        "CPI August 2026": (2026, 9, 14),
+        "CPI September 2026": (2026, 10, 12),
+        "CPI October 2026": (2026, 11, 12),
+        "CPI November 2026": (2026, 12, 14),
+    }
+    for name, ymd in expected_ist_dates.items():
+        dt = datetime.fromisoformat(get_event(name).scheduled_timestamp_utc).astimezone(IST)
+        assert (dt.year, dt.month, dt.day) == ymd
+        assert (dt.hour, dt.minute) == (16, 0)
+        assert dt.weekday() < 5  # never scheduled on a weekend
+
+
+def test_no_event_name_claims_to_be_released_before_it_is():
+    assert not any("released" in e.event_name.lower() for e in EVENTS)
+
+
+def test_get_event_unknown_name_raises():
+    with pytest.raises(KeyError):
+        get_event("RBI MPC Jan 1999")
 
 
 def test_rbi_and_budget_marked_minute_confidence():

@@ -40,12 +40,75 @@ def build_reference_table() -> tuple[dict[str, dict], dict[str, str]]:
     return option_reference, index_keys
 
 
-def build_subscribe_message(instrument_keys: list[str], mode: str = "full_d5") -> bytes:
-    """UTF-8-encoded JSON, sent as a binary WebSocket frame -- the doc
-    page's prose says the request must be sent in binary format but only
-    ever shows a JSON-shaped payload; best-effort read. Live-tested
-    2026-08-26: connects and sends without rejection, but real tick
-    delivery isn't confirmed yet -- see BUGS.md BUG-3 for the open
-    question (thin near-close activity vs. a genuine format issue)."""
+INSTRUMENT_MASTER_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+FUTURE_UNDERLYINGS = {"NIFTY": "NIFTY", "BANKNIFTY": "BANKNIFTY"}
+
+
+def _download_instrument_master() -> list[dict]:
+    import gzip
+    import urllib.request
+
+    request = urllib.request.Request(INSTRUMENT_MASTER_URL, headers={"User-Agent": "Mozilla/5.0"})
+    return json.loads(gzip.decompress(urllib.request.urlopen(request, timeout=60).read()))
+
+
+def build_futures_reference(now_ms: int | None = None, fetch_fn=None) -> dict[str, dict]:
+    """instrument_key -> {underlying, expiry (ISO date)} for the nearest
+    not-yet-expired NIFTY and BANKNIFTY futures, from Upstox's public
+    instrument master (no auth needed; format verified 2026-10-05, e.g.
+    {'instrument_key': 'NSE_FO|48704', 'trading_symbol': 'NIFTY FUT 27 OCT 26',
+    'instrument_type': 'FUT', 'underlying_symbol': 'NIFTY', 'expiry': <ms>}).
+
+    NEVER raises: the futures leg is a control series (does the spot index
+    lag its own future?), not the headline measurement, so a failed
+    download must not abort an event capture -- it logs and returns {}."""
+    import logging
+    import time
+    from datetime import datetime, timedelta, timezone
+
+    ist = timezone(timedelta(hours=5, minutes=30))
+    now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+    try:
+        instruments = (fetch_fn or _download_instrument_master)()
+    except Exception as exc:  # noqa: BLE001 -- see docstring
+        logging.getLogger("diffusion").warning("futures reference unavailable (%r); continuing without the futures leg", exc)
+        return {}
+
+    nearest: dict[str, dict] = {}
+    for inst in instruments:
+        if inst.get("segment") != "NSE_FO" or inst.get("instrument_type") != "FUT":
+            continue
+        underlying = FUTURE_UNDERLYINGS.get(inst.get("underlying_symbol"))
+        expiry_ms = inst.get("expiry")
+        if underlying is None or not expiry_ms or expiry_ms <= now_ms:
+            continue
+        if underlying not in nearest or expiry_ms < nearest[underlying]["expiry_ms"]:
+            nearest[underlying] = {"instrument_key": inst["instrument_key"], "expiry_ms": expiry_ms}
+
+    return {
+        v["instrument_key"]: {
+            "underlying": u,
+            "expiry": datetime.fromtimestamp(v["expiry_ms"] / 1000, tz=ist).date().isoformat(),
+        }
+        for u, v in nearest.items()
+    }
+
+
+# Valid v3 subscribe modes, per Upstox's own docs (verified 2026-10-05):
+# "full_d5" is the protobuf *enum* name (RequestMode.full_d5) echoed back on
+# decoded messages -- it is NOT a valid string for the subscribe request.
+# The 5-level-depth mode is requested as "full". full_d30 needs Upstox Plus.
+VALID_SUBSCRIBE_MODES = ("ltpc", "option_greeks", "full", "full_d30")
+
+
+def build_subscribe_message(instrument_keys: list[str], mode: str = "full") -> bytes:
+    """UTF-8-encoded JSON, sent as a binary WebSocket frame (Upstox's docs:
+    "the request message should be sent in binary format, not as a text
+    message"). Raises on an unknown mode instead of sending it: an invalid
+    mode string is accepted silently by the server and simply never
+    registers a subscription -- that was the root cause of BUGS.md BUG-3
+    (mode="full_d5" -> connected cleanly, zero live_feed messages)."""
+    if mode not in VALID_SUBSCRIBE_MODES:
+        raise ValueError(f"invalid subscribe mode {mode!r}; valid modes: {VALID_SUBSCRIBE_MODES}")
     message = {"guid": str(uuid.uuid4()), "method": "sub", "data": {"mode": mode, "instrumentKeys": instrument_keys}}
     return json.dumps(message).encode("utf-8")

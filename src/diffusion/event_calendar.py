@@ -75,35 +75,39 @@ EVENTS.append(
 )
 
 # --- CPI (MoSPI): released 16:00 IST, after NSE's 15:30 IST close -- an
-# after-hours/gap event, not intraday. Release time
-# itself is confirmed (advanced from 17:30 IST in Nov 2024 specifically to
-# land closer to market close); exact per-month 2026 dates follow an
-# observed ~12-13-day-after-month-end pattern from confirmed instances
-# (Mar data -> Apr 13, Apr data -> May 12, Jun data -> Jul 13) but a full
-# 2026 calendar wasn't found in one place -- entered as "approximate" and
-# must be re-verified against mospi.gov.in before being trusted for a real
-# capture (ROADMAP.md Phase 1, BUGS.md anticipated pitfalls).
-_CPI_RELEASES_APPROX = [
-    ("CPI July 2026 (released)", 2026, 8, 12),
-    ("CPI August 2026 (released)", 2026, 9, 12),
-    ("CPI September 2026 (released)", 2026, 10, 13),
+# after-hours/gap event, not intraday (advanced from 17:30 IST in Nov 2024).
+# Dates below come from MoSPI's own Advance Release Calendar 2026-27
+# (mospi.gov.in, "ADVANCE RELEASE CALENDAR 2026-27 FINAL 05.02.2026"), which
+# schedules CPI on the 12th of every month; when the 12th is a weekend/
+# holiday the release moves to the next working day -- Aug 2026 data was
+# released Mon 2026-09-14 (the 12th was a Saturday), confirmed against
+# MoSPI's own press release. Verified 2026-10-05.
+#   name, y, m, d, timing_confidence
+# "minute" = the calendar date is MoSPI-published (or confirmed by the
+# actual release); "approximate" = the 12th falls on a weekend and the
+# next-working-day shift hasn't been confirmed by a release yet.
+_CPI_RELEASES = [
+    ("CPI July 2026", 2026, 8, 12, "minute"),
+    ("CPI August 2026", 2026, 9, 14, "minute"),
+    ("CPI September 2026", 2026, 10, 12, "minute"),
+    ("CPI October 2026", 2026, 11, 12, "minute"),
+    ("CPI November 2026", 2026, 12, 14, "approximate"),  # Dec 12 is a Saturday
 ]
 
-for _name, _y, _m, _d in _CPI_RELEASES_APPROX:
+for _name, _y, _m, _d, _confidence in _CPI_RELEASES:
     EVENTS.append(
         ShockEvent(
             event_name=_name,
             scheduled_timestamp_utc=_ist(_y, _m, _d, 16, 0),
-            timing_confidence="approximate",
+            timing_confidence=_confidence,
             market_hours_event=False,
             affected_underlyings=("NIFTY", "BANKNIFTY"),
             source_note=(
-                "MoSPI releases CPI at 16:00 IST (confirmed, advanced from "
-                "17:30 IST in Nov 2024). This specific release date is "
-                "extrapolated from the observed ~12-13-day-after-month-end "
-                "pattern, NOT confirmed against a published 2026 calendar -- "
-                "re-verify against mospi.gov.in before trusting it for a "
-                "real capture."
+                "MoSPI releases CPI at 16:00 IST, after NSE's 15:30 close. "
+                "Date from MoSPI's Advance Release Calendar 2026-27 (CPI on the "
+                "12th, shifted to the next working day when that is a "
+                "weekend/holiday); 'approximate' where the shift is "
+                "unconfirmed -- re-check mospi.gov.in before a real capture."
             ),
         )
     )
@@ -117,6 +121,42 @@ def upcoming_events(now: datetime | None = None) -> list[ShockEvent]:
     be captured live regardless of how well-defined its timestamp is."""
     reference = now if now is not None else datetime.now(timezone.utc)
     return [e for e in EVENTS if datetime.fromisoformat(e.scheduled_timestamp_utc) > reference]
+
+
+PLACEBO_PREFIX = "PLACEBO "
+
+
+def placebo_event(date_str: str, time_str: str) -> ShockEvent:
+    """A no-news CONTROL window: same machinery and window as a real event
+    but pinned to an ordinary day/time (IST, e.g. "2026-10-06", "10:00").
+    Running the identical detector on it measures the false-positive rate --
+    how often "a first move" is found when nothing happened -- which is
+    the noise floor any real-event lag has to be read against."""
+    year, month, day = (int(x) for x in date_str.split("-"))
+    hour, minute = (int(x) for x in time_str.split(":"))
+    return ShockEvent(
+        event_name=f"{PLACEBO_PREFIX}{date_str} {time_str} IST",
+        scheduled_timestamp_utc=_ist(year, month, day, hour, minute),
+        timing_confidence="minute",
+        market_hours_event=True,
+        affected_underlyings=("NIFTY", "BANKNIFTY"),
+        source_note="Placebo/control window: no scheduled news. Detections here are false positives.",
+    )
+
+
+def get_event(event_name: str) -> ShockEvent:
+    """Look an event up by exact name (placebo names are parsed back into
+    events); raises KeyError listing valid names."""
+    if event_name.startswith(PLACEBO_PREFIX):
+        try:
+            date_str, time_str, _tz = event_name[len(PLACEBO_PREFIX):].split(" ")
+            return placebo_event(date_str, time_str)
+        except ValueError as exc:
+            raise KeyError(f"malformed placebo event name {event_name!r}") from exc
+    for e in EVENTS:
+        if e.event_name == event_name:
+            return e
+    raise KeyError(f"unknown event {event_name!r}; known events: {[e.event_name for e in EVENTS]}")
 
 
 def market_hours_events() -> list[ShockEvent]:

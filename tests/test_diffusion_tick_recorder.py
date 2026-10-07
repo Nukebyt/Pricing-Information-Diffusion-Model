@@ -183,3 +183,134 @@ def test_record_gap_tick_skips_underlying_with_no_expiries(monkeypatch):
 
     rows = record_gap_tick(GAP_EVENT, "pre_close", conn=None, insert_ticks_fn=lambda conn, rows: None)
     assert all(r["underlying"] == "NIFTY" for r in rows)
+
+
+# --- streaming loop (fake websocket; BUG-4 / BUG-5 regressions) ---
+
+import asyncio
+
+import pytest
+import websockets.exceptions
+from MarketDataFeed_pb2 import initial_feed, live_feed, market_info
+
+from tick_recorder import CaptureStats, _connect_and_record, seconds_until
+
+FAR_FUTURE = datetime.now(timezone.utc) + timedelta(hours=1)
+
+
+class FakeWS:
+    """Replays encoded messages through recv(); when exhausted either drops
+    the connection (ConnectionClosed, like a real network drop) or blocks."""
+
+    def __init__(self, messages, drop_at_end=True):
+        self.messages = list(messages)
+        self.sent = []
+        self.drop_at_end = drop_at_end
+
+    async def send(self, data):
+        self.sent.append(data)
+
+    async def recv(self):
+        if self.messages:
+            return self.messages.pop(0)
+        if self.drop_at_end:
+            raise websockets.exceptions.ConnectionClosedError(None, None)
+        await asyncio.sleep(3600)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def _encode(feed_type, feeds):
+    response = FeedResponse(type=feed_type)
+    for key, feed in feeds.items():
+        response.feeds[key].CopyFrom(feed)
+    return response.SerializeToString()
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def _record(ws, stop_at=FAR_FUTURE, **kwargs):
+    inserted = []
+    stats = CaptureStats()
+    coro = _connect_and_record(
+        REFERENCE, INDEX_KEYS, "e", stop_at, conn=None,
+        insert_ticks_fn=lambda conn, rows: inserted.extend(rows),
+        stats=stats, connect_fn=lambda url: ws, url_fn=lambda: "wss://fake", **kwargs,
+    )
+    return coro, inserted, stats
+
+
+def test_buffered_ticks_flushed_when_connection_drops():
+    # BUG-4: ticks sitting in the buffer (< flush_every) used to be lost
+    # when the connection raised.
+    ws = FakeWS([_encode(live_feed, {"NSE_INDEX|Nifty 50": _index_feed(24334.55)})])
+    coro, inserted, stats = _record(ws, flush_every=1000, flush_interval_seconds=3600)
+    with pytest.raises(websockets.exceptions.ConnectionClosed):
+        _run(coro)
+    assert [r["kind"] for r in inserted] == ["spot"]
+    assert stats.ticks == 1 and stats.messages_by_type == {"live_feed": 1}
+
+
+def test_subscribe_message_sent_with_valid_mode():
+    import json
+
+    ws = FakeWS([], drop_at_end=True)
+    coro, _, _ = _record(ws)
+    with pytest.raises(websockets.exceptions.ConnectionClosed):
+        _run(coro)
+    sent = json.loads(ws.sent[0].decode("utf-8"))
+    assert sent["data"]["mode"] == "full"
+    assert set(sent["data"]["instrumentKeys"]) == {"NSE_FO|C1", "NSE_INDEX|Nifty 50"}
+
+
+def test_initial_feed_dropped_on_reconnect_but_kept_on_first_connect():
+    # BUG-5: a reconnect's initial_feed snapshot is stale state stamped with
+    # the reconnect time -- it must not become a fake post-shock tick.
+    snapshot = _encode(initial_feed, {"NSE_INDEX|Nifty 50": _index_feed(24000.0)})
+    live = _encode(live_feed, {"NSE_INDEX|Nifty 50": _index_feed(24010.0)})
+
+    coro, inserted, _ = _record(FakeWS([snapshot, live]), skip_initial_feed=True)
+    with pytest.raises(websockets.exceptions.ConnectionClosed):
+        _run(coro)
+    assert [r["price_paise"] for r in inserted] == [2401000]
+
+    coro, inserted, _ = _record(FakeWS([snapshot, live]), skip_initial_feed=False)
+    with pytest.raises(websockets.exceptions.ConnectionClosed):
+        _run(coro)
+    assert [r["price_paise"] for r in inserted] == [2400000, 2401000]
+
+
+def test_market_info_messages_counted_but_produce_no_rows():
+    ws = FakeWS([_encode(market_info, {})])
+    coro, inserted, stats = _record(ws)
+    with pytest.raises(websockets.exceptions.ConnectionClosed):
+        _run(coro)
+    assert inserted == []
+    assert stats.messages_by_type == {"market_info": 1} and stats.ticks == 0
+
+
+def test_stops_at_window_end_even_when_feed_is_silent():
+    # recv() blocks forever; the loop must still exit when stop_at passes.
+    ws = FakeWS([], drop_at_end=False)
+    coro, _, _ = _record(ws, stop_at=datetime.now(timezone.utc) + timedelta(seconds=0.3), flush_interval_seconds=0.1)
+    _run(asyncio.wait_for(coro, timeout=5))  # would raise TimeoutError if it never stopped
+
+
+def test_exchange_timestamp_and_expiry_recorded():
+    feed = _option_feed(150.0, 152.0)
+    feed.fullFeed.marketFF.ltpc.ltt = 1791345600000
+    row = feed_to_tick_row("NSE_FO|C1", feed, REFERENCE, INDEX_KEYS, "e", NOW)
+    assert row["exchange_ts_ms"] == 1791345600000
+    assert row["expiry"] == "2026-10-07"
+
+
+def test_seconds_until():
+    now = datetime(2026, 10, 7, 4, 0, tzinfo=timezone.utc)
+    assert seconds_until(now + timedelta(seconds=90), now) == 90
+    assert seconds_until(now - timedelta(seconds=5), now) == -5

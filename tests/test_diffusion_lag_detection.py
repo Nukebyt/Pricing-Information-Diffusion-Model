@@ -134,3 +134,46 @@ def test_summarize_lags_single_value_zero_stdev():
     assert stats["n"] == 1
     assert stats["mean"] == 15.0
     assert stats["stdev"] == 0.0
+
+
+# --- min_consecutive confirmation ---
+
+def _flat_noisy_series_with_spike_then_real_move():
+    """Baseline +/-5 around 100; a single-tick spike at +5s that immediately
+    reverts, then a real, sustained jump starting at +30s."""
+    ticks = []
+    for i in range(12):
+        t = SHOCK - timedelta(seconds=(12 - i) * 5)
+        ticks.append((t.isoformat(), 100.0 + (5.0 if i % 2 == 0 else -5.0)))
+    for i in range(12):
+        offset = i * 5
+        if offset == 5:
+            price = 130.0  # lone spike
+        elif offset >= 30:
+            price = 130.0  # real, sustained move
+        else:
+            price = 100.0 + (5.0 if i % 2 == 0 else -5.0)
+        ticks.append(((SHOCK + timedelta(seconds=offset)).isoformat(), price))
+    return ticks
+
+
+def test_min_consecutive_1_flags_the_lone_spike():
+    move = detect_first_move(_flat_noisy_series_with_spike_then_real_move(), SHOCK.isoformat(), min_consecutive=1)
+    assert (datetime.fromisoformat(move.timestamp_utc) - SHOCK).total_seconds() == 5
+
+
+def test_min_consecutive_3_skips_spike_and_reports_start_of_the_real_run():
+    move = detect_first_move(_flat_noisy_series_with_spike_then_real_move(), SHOCK.isoformat(), min_consecutive=3)
+    # reported timestamp is the FIRST tick of the sustained run, not the 3rd
+    assert (datetime.fromisoformat(move.timestamp_utc) - SHOCK).total_seconds() == 30
+
+
+def test_min_consecutive_must_be_positive():
+    with pytest.raises(ValueError):
+        detect_first_move(_flat_noisy_series_with_spike_then_real_move(), SHOCK.isoformat(), min_consecutive=0)
+
+
+def test_lead_lag_threads_min_consecutive_through():
+    spot = _series(24000.0, 5.0, 24100.0, jump_at_offset_s=10)
+    option = _series(150.0, 0.5, 160.0, jump_at_offset_s=40)
+    assert spot_option_lag_seconds(spot, option, SHOCK.isoformat(), min_consecutive=2) == pytest.approx(30, abs=5)

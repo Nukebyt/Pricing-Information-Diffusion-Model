@@ -4,6 +4,7 @@ diffusion-timeline chart (Phase 4)."""
 from __future__ import annotations
 
 from datetime import datetime
+from statistics import median
 
 Tick = tuple[str, float]  # (timestamp_utc ISO string, price)
 
@@ -17,12 +18,19 @@ def time_to_90pct_adjustment(
     shock_timestamp_utc: str,
     pre_level: float,
     settle_seconds_after: int = 1800,
+    settled_level_window_seconds: float | None = None,
 ) -> float | None:
     """pre_level: the price level just before the shock (e.g.
     detect_first_move()'s baseline_mean). The "new level" is taken as the
     last observed price within settle_seconds_after of the shock -- a
     pragmatic proxy for "settled," not a provable claim the market is done
     moving.
+
+    settled_level_window_seconds: if given, the new level is the MEDIAN of
+    the post-shock ticks in the final N seconds of the settle window
+    instead of the single last tick -- one noisy last tick (a bid/ask
+    bounce) otherwise moves the 90% threshold and with it the answer.
+    None keeps the original last-tick behaviour.
 
     Returns seconds from shock to the first post-shock tick that has closed
     at least 90% of the gap between pre_level and the new level, or None if
@@ -39,6 +47,10 @@ def time_to_90pct_adjustment(
         windowed = post  # nothing landed inside the settle window -- use whatever was captured
 
     new_level = windowed[-1][1]
+    if settled_level_window_seconds is not None:
+        last_time = _parse(windowed[-1][0]).timestamp()
+        tail = [p for t, p in windowed if _parse(t).timestamp() >= last_time - settled_level_window_seconds]
+        new_level = median(tail)
     total_move = new_level - pre_level
     if total_move == 0:
         return 0.0  # already at the "new" level -- trivially adjusted
