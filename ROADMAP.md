@@ -5,7 +5,7 @@
 
 **Companion doc:** [BUGS.md](BUGS.md) — bug/decision log, filed as things are actually found while building, same discipline as the sibling project's own log.
 
-**Current Status:** 🟡 Phases 0–4 (code) built and unit-tested against synthetic data with known injected ground truth, plus two of Phase 5's three stretch angles: NIFTY-vs-BANKNIFTY cross-index lead-lag, and overnight/gap diffusion for after-hours (CPI) events — both built by generalizing/extending existing modules rather than duplicating them (see Phase 5 below). GDELT-based unscheduled-event catching remains unbuilt. Phase 1's event calendar is populated with real, WebSearch-verified dates. This project now stands on its own — its own repo, its own trimmed copy of the Upstox data layer (§0) — rather than living inside the sibling project's shared tree. Live tick capture (the actual data this project needs to answer any of its headline questions) is calendar-gated — see §0. This project's own test suite: 73/73.
+**Current Status:** 🟡 Phases 0–4 (code) built and unit-tested against synthetic data with known injected ground truth, plus two of Phase 5's three stretch angles: NIFTY-vs-BANKNIFTY cross-index lead-lag, and overnight/gap diffusion for after-hours (CPI) events — both built by generalizing/extending existing modules rather than duplicating them (see Phase 5 below). GDELT-based unscheduled-event catching remains unbuilt. Phase 1's event calendar is populated with real, WebSearch-verified dates. This project now stands on its own — its own repo, its own trimmed copy of the Upstox data layer (§0) — rather than living inside the sibling project's shared tree. Live tick capture (the actual data this project needs to answer any of its headline questions) is calendar-gated — see §0. This project's own test suite: 147/147 (2026-10-05). **2026-10-05 update:** pre-event review found and fixed the root cause of the live no-ticks problem (invalid subscribe mode `full_d5` -> `full`), plus buffered-tick loss on disconnect, a reconnect-snapshot artifact, and CPI dates that were a day off MoSPI's published calendar (BUGS.md BUG-3..6); added `analyze_event.py` and `diffusion_cli.py` so a capture goes straight to per-event numbers; see [RUNBOOK.md](RUNBOOK.md) for the event-day procedure.
 
 ---
 
@@ -57,7 +57,7 @@ Precise shock definition is the single most important design decision in this pr
 
 - [x] **RBI MPC decisions** — verified via WebSearch (2026-08-26): six meetings/year, each a 3-day session, decision announced by the Governor at **10:00 IST** on day 3, press conference at 12:00 IST. FY26-27 dates: Apr 8, Jun 5, Aug 5, Oct 7, Dec 4, 2026 (Aug 5 already passed relative to today's date). `timing_confidence="minute"` — the 10:00 IST convention is well-established but the recorder should still gate on the exchange's own live market-status endpoint rather than trusting the clock alone, since a meeting occasionally runs long.
 - [x] **Union Budget** — presented in Parliament at **11:00 IST**, historically Feb 1 by convention. FY26-27 budget: 2026-02-01 (a Sunday — the first time in India's history a budget was presented on one), already passed relative to today. `timing_confidence="minute"`.
-- [x] **CPI (MoSPI)** — release time confirmed **16:00 IST** (advanced from 17:30 IST in Nov 2024 specifically to align with market close). This is **after** NSE's 15:30 IST close — an after-hours/gap event, not an intraday one; flagged `market_hours_event=False`. Exact per-month release dates follow an observed ~12–13-days-after-month-end pattern (confirmed instances: Mar data → Apr 13, Apr data → May 12, Jun data → Jul 13) but a full 2026 calendar wasn't found in one place — future months are entered as `timing_confidence="approximate"` and should be re-verified against `mospi.gov.in`'s own release calendar before being trusted for real capture, not assumed from the pattern alone.
+- [x] **CPI (MoSPI)** — release time confirmed **16:00 IST** (advanced from 17:30 IST in Nov 2024 specifically to align with market close). This is **after** NSE's 15:30 IST close — an after-hours/gap event, not an intraday one; flagged `market_hours_event=False`. **Updated 2026-10-05:** the original per-month dates were extrapolated from an observed "~12–13 days after month end" pattern and turned out to be up to a day off (BUGS.md BUG-6). They now come from MoSPI's published Advance Release Calendar 2026-27: CPI on the 12th of each month, moved to the next working day when that is a weekend/holiday (Aug data → Mon Sep 14; Sep data → Mon Oct 12). Only Nov-data (Dec 12 is a Saturday, shift unconfirmed) remains `timing_confidence="approximate"`.
 - [x] Each event carries: `event_name, scheduled_timestamp_utc, timing_confidence, market_hours_event, affected_underlyings, source_note` — `src/diffusion/event_calendar.py`.
 - [ ] GDELT as a secondary validation/unscheduled-event source — deferred to Phase 5, not needed until the scheduled pipeline has real data.
 
@@ -72,7 +72,7 @@ Precise shock definition is the single most important design decision in this pr
 - [x] `capture_window()` — pure function computing the `[pre_seconds before, post_seconds after]` UTC window around a scheduled event.
 - [x] `_connect_and_record()` / `run_capture()` — the live streaming loop: fresh authorized WS URL per attempt, reconnect with the same event's window still active, recording every tick to `data/diffusion_ticks.db` instead of running arbitrage checks.
 - [x] `record_gap_tick()` — for after-hours events (CPI/IIP/GDP): a single REST snapshot (spot + near-ATM option) tagged to a named point (`pre_close` / `post_open` / `post_open_settled`), meant to be triggered by a scheduled job around the release, not run continuously — there is nothing to stream while NSE is shut, and naively polling into dead air just produces frozen, duplicate reads.
-- [ ] **Live confirmation — partial, real progress made 2026-08-26** (BUGS.md BUG-3): ran a bounded live smoke test in the last ~13 minutes of a real trading session. **Confirmed live:** REST reference-table build (660 real legs), the WS-authorize REST call (real host recorded for the first time: `wss://wsfeeder-api.upstox.com/market-data-feeder/v3/upstox-developer-api/feeds`), WS connect, and subscribe send with no rejection. **Not yet confirmed:** actual `live_feed`-typed tick messages — three attempts all received only a single `market_info`-typed message per connection, zero real ticks. Root cause genuinely undetermined (near-close thin activity vs. a subscribe-format problem) — see BUG-3 for the two live hypotheses and the concrete next diagnostic step (re-run with a full-session window from market open, not the last 15 minutes before close). Still need a real event capture (**RBI MPC, 2026-10-07, 10:00 IST**) to fully close this out, but ideally re-run a plain connectivity check earlier in a trading day first, to isolate BUG-3 before spending the one real shot at a scheduled event on an unresolved subscribe-format question.
+- [ ] **Live confirmation — root cause found 2026-10-05, fix awaiting a live pass:** the no-ticks problem below was an invalid subscribe mode (`"full_d5"`, a protobuf enum name; the API takes `full`), now fixed and guarded. Run `diffusion_cli.py preflight` during NORMAL_OPEN to close it (RUNBOOK.md). Historical record of the original 2026-08-26 session follows (BUGS.md BUG-3): ran a bounded live smoke test in the last ~13 minutes of a real trading session. **Confirmed live:** REST reference-table build (660 real legs), the WS-authorize REST call (real host recorded for the first time: `wss://wsfeeder-api.upstox.com/market-data-feeder/v3/upstox-developer-api/feeds`), WS connect, and subscribe send with no rejection. **Not yet confirmed:** actual `live_feed`-typed tick messages — three attempts all received only a single `market_info`-typed message per connection, zero real ticks. Root cause genuinely undetermined (near-close thin activity vs. a subscribe-format problem) — see BUG-3 for the two live hypotheses and the concrete next diagnostic step (re-run with a full-session window from market open, not the last 15 minutes before close). Still need a real event capture (**RBI MPC, 2026-10-07, 10:00 IST**) to fully close this out, but ideally re-run a plain connectivity check earlier in a trading day first, to isolate BUG-3 before spending the one real shot at a scheduled event on an unresolved subscribe-format question.
 
 **Exit criteria:** Code and synthetic tests done; live capture against a real event is the one remaining step.
 
@@ -109,7 +109,7 @@ Core analysis phase — the actual answer to the headline question, once real ev
 
 ### **Phase 5 — Stretch** 🟡 2 of 3 angles built, code done
 - [x] **NIFTY vs. BANKNIFTY cross-index lead-lag** — the second candidate headline angle from the original scope decision. Reused the tick recorder unchanged (both indices are already tracked — no new data collection needed) and generalized the detection/charting layer instead of duplicating it: `lag_detection.py`'s `detect_first_move()` now sits behind a shared `lead_lag_seconds()` primitive, with `spot_option_lag_seconds()` (headline) and `cross_index_lag_seconds()` (this angle) as thin, semantically-named wrappers over it — same pattern in `charts.py` (`plot_diffusion_timeline()` generic, `plot_spot_option_diffusion_timeline()`/`plot_cross_index_diffusion_timeline()` wrappers). `diffusion_db.py`'s `fetch_ticks()` gained an `underlying` filter (both indices' spot rows share `event_name`/`kind="spot"`, differentiated only by that field) plus `rows_to_ticks()` to bridge DB rows into the `Tick` shape the detection layer expects. Synthetic-tested the same way as the headline metric — known injected lag, both directions, and a null case. Still blocked on the same live-capture constraint as Phase 2/3: real numbers need a real captured event.
-- [x] **Overnight/gap diffusion for after-hours events** — `gap_diffusion.py`'s `gap_move_breakdown()` splits an after-hours event's eventual move into "happened in the closed-market gap" vs. "continued once trading resumed," given three named REST snapshots (`record_gap_tick()`'s `pre_close`/`post_open`/`post_open_settled`). Deliberately doesn't clamp the resulting fraction to `[0, 1]` — a real price can open past its eventual settled level and partially revert, which needs a fraction >1 (gap overshot) or negative (post-open move reversed) to be represented honestly rather than silently clipped into a misleading number (BUGS.md DEC-6). Synthetic-tested including the zero-total-move case (reported as `None`, not fabricated). Same calendar-gated blocker as everything else here — the real numbers need a real captured CPI release (next approximate one: ~2026-09-12).
+- [x] **Overnight/gap diffusion for after-hours events** — `gap_diffusion.py`'s `gap_move_breakdown()` splits an after-hours event's eventual move into "happened in the closed-market gap" vs. "continued once trading resumed," given three named REST snapshots (`record_gap_tick()`'s `pre_close`/`post_open`/`post_open_settled`). Deliberately doesn't clamp the resulting fraction to `[0, 1]` — a real price can open past its eventual settled level and partially revert, which needs a fraction >1 (gap overshot) or negative (post-open move reversed) to be represented honestly rather than silently clipped into a misleading number (BUGS.md DEC-6). Synthetic-tested including the zero-total-move case (reported as `None`, not fabricated). Same calendar-gated blocker as everything else here — the real numbers need a real captured CPI release (next: Sep-2026 data on Mon 2026-10-12, 16:00 IST, per MoSPI's Advance Release Calendar; capture with `diffusion_cli.py gap`, see RUNBOOK.md).
 - [ ] **GDELT as an unscheduled-shock catcher** — a global event database, usable here to catch surprise events (an unscheduled RBI intervention, a surprise geopolitical shock) once the scheduled pipeline is validated, and to test a real hypothesis: surprise events should diffuse slower/noisier than anticipated ones, since no one was positioned in advance.
 - [ ] Cross-project synthesis: a short section explicitly connecting the two projects — "one finds structural pricing errors, the other measures how fast information gets priced in — together they cover static and dynamic market efficiency."
 
@@ -155,9 +155,15 @@ Pricing-Information-Diffusion-Model/
 │       ├── lag_detection.py        # Phase 3: first-move + lead-lag (+ cross-index wrapper)
 │       ├── adjustment_curves.py    # Phase 3: settle-speed + normalized paths
 │       ├── charts.py               # Phase 4: diffusion-timeline plot (generic + named wrappers)
-│       └── gap_diffusion.py        # Phase 5: overnight-gap breakdown for after-hours (CPI) events
-├── tests/                     # 73 tests
-└── data/                       # diffusion_ticks.db + generated charts (gitignored / committed selectively)
+│       ├── gap_diffusion.py        # Phase 5: overnight-gap breakdown for after-hours (CPI) events
+│       ├── analyze_event.py        # capture -> per-event numbers (ATM leg + basket, futures, IV, placebo, JSON, charts)
+│       ├── pooling.py              # cross-event bootstrap CI / sign test / markdown summary
+│       ├── synthetic.py            # clearly-labelled synthetic capture for demo + smoke test
+│       └── diffusion_cli.py        # event-day entrypoint: events / preflight / capture / gap / analyze
+├── RUNBOOK.md                 # event-day checklist
+├── INTERVIEW_PREP.md          # presentation guide by outcome scenario
+├── tests/                     # 147 tests (incl. local-websocket integration test)
+└── data/                       # diffusion_ticks.db, logs/, results/, diffusion_charts/ (gitignored)
 ```
 
 ---
@@ -177,7 +183,30 @@ This project was originally built inside the same repo as the companion arbitrag
 
 ---
 
-## 8. Notes for Future You / The AI Assistant
+## 7b. Improvements
+
+Status as of 2026-10-05. Anything that changes the *method* after real results exist must be a new DEC entry applied to every event (forking paths); the primary method was pre-registered in DEC-10.
+
+| # | Improvement | Status |
+|---|---|---|
+| 1 | Close BUG-3 live (`preflight` during NORMAL_OPEN) | 🟢 done 2026-10-06: preflight PASSED live (172 live_feed messages, 8,193 ticks in 45s) |
+| 2 | Exchange-timestamp lag + feed-delay diagnostics | 🟢 built (`exchange_ts_ms` stored; experimental until validated live) |
+| 3 | Returns-based first-move detection | 🟢 built; **primary** method (DEC-10) |
+| 4 | Median-of-last-60s settled level | 🟢 built |
+| 5 | ATM ±2 basket + IV series | 🟢 built (IV units unverified; used as a time series only) |
+| 6 | Futures control leg | 🟢 built (near-month NIFTY/BANKNIFTY from the public instrument master) |
+| 7 | Placebo / null windows | 🟢 built: within-event pseudo-shock + `capture --placebo-at` control windows |
+| 8 | Pooling statistics | 🟢 built (`pooling.py`; bootstrap CI + sign test, withheld below n = 6) |
+| 9 | Unscheduled shocks (GDELT) | ⬜ not started — needs ≥ several scheduled events validated first |
+| 10 | Ops hardening | 🟡 stall alarm, undecodable-frame tolerance, retry-on-any-error built; **not** covered: process kill / power loss (no external supervisor) |
+
+Next methodological step (motivated by the first real event, 2026-10-07): replace first-crossing lead-lag with a signal-to-noise-free estimate over the whole window - lagged cross-correlation of 1-second returns between spot/future/option (or an information-share model) - because first-crossing times conflate reaction speed with each series' detectability (README, "First Real Event"). Any such change is a new DEC entry applied to all events.
+
+Further ideas not yet done: regress lag on liquidity (OI/volume) and surprise size once n is large; an `--exchange-time` primary option once validated; multi-day control windows to build a proper null distribution.
+
+---
+
+## 8. Notes for future work
 
 - Real Phase 2/3 progress is **calendar-gated** — you cannot accelerate this with a backfill script. The next real capturable market-hours event is the **2026-10-07 RBI MPC** (10:00 IST decision); mark your own calendar, not just this file's.
 - If a capture window fails (missed connection, API downtime during the actual event), don't force-fit bad data — skip that event and note it in BUGS.md. A clean 5-event dataset beats a noisy 10-event one.

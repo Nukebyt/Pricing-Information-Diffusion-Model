@@ -103,6 +103,44 @@ Severity/impact tags, optional: `#data-integrity #logic #concurrency #performanc
 
 #decision #tooling
 
+### [DEC-8] `min_consecutive` confirmation on first-move detection, reported alongside the plain rule
+
+- **Phase:** 3
+- **Date:** 2026-10-05
+- **Context:** the detector flags the first tick whose z-score against the pre-shock baseline reaches 3. Option mid-prices sit on a 0.05 tick grid and one-tick bid/ask bounces are common, so a single noisy tick right after the shock can be reported as "the option moved first" — which would flip the sign of the headline lag.
+- **Decision:** added `min_consecutive` (default 1, so existing behavior and tests are unchanged). Analysis reports `confirm_1` (plain rule) and `confirm_3` (3 consecutive breaching ticks, reporting the *first* tick of the run) side by side. If they disagree materially, that event's lag is noise-sensitive and should be described that way, not as a clean number.
+- **Not done, deliberately:** returns-based / MAD-based detection, or changing the default threshold. Changing the method after seeing real data is a forking-paths problem — any such change should be decided before the first real event is analysed and applied to every event (see ROADMAP "Improvements").
+
+#decision #correctness
+
+### [DEC-9] Analysis picks one ATM option leg per type instead of passing all option rows to the lag function
+
+- **Phase:** 3
+- **Date:** 2026-10-05
+- **Context:** the recorder stores ~660 option legs across strikes and two expiries in one table; `fetch_ticks(kind="option")` returns them all interleaved. Feeding that to `spot_option_lag_seconds()` would compute a baseline mean/stdev across *different contracts* — a meaningless series that still yields a plausible-looking number.
+- **Decision:** `analyze_event.pick_atm_legs()` selects, per option type, the nearest-expiry contract closest to the last pre-shock spot that has >=5 pre-shock ticks and >=1 post-shock tick (an untraded ATM strike falls back to its nearest liquid neighbour). The chosen strike/expiry are recorded in the result so the choice is auditable. `expiry` and the exchange's own last-trade timestamp (`exchange_ts_ms`) became DB columns so this choice is possible at all.
+- **Interview angle:** a "data shape doesn't match the function's input contract" catch before it silently produced a number.
+
+#decision #correctness
+
+### [DEC-10] Pre-registered analysis plan: primary detector chosen BEFORE any real event was seen
+
+- **Phase:** 3
+- **Date:** 2026-10-05 (two days before the first real capture)
+- **Context:** the first-move detector has real degrees of freedom — z-threshold, level vs. return statistic, single-tick vs. confirmed breach, which option strike, which time base. With one event per month, picking whichever combination produces a clean number *after* seeing the data would be a forking-paths problem that no amount of later honesty fixes.
+- **Decision (fixed now, applied to every event):**
+  - **Primary** = `returns_c3`: z-score (threshold 3.0) of the trailing 5-tick *return* against the pre-shock return distribution, requiring 3 consecutive breaching ticks. Chosen because a level z-score is biased by pre-shock drift/random-walk (demonstrated on the synthetic demo: on BANKNIFTY futures the level detector reports the wrong sign, +3s vs the injected -3s, while the returns detector recovers it), and confirmation guards against single-tick bid/ask bounces.
+  - **Sensitivity (always reported, never substituted):** `level_c1`, `level_c3`, `returns_c1`. If the primary and the sensitivities disagree on sign, that event is reported as "method-sensitive", not resolved by picking one.
+  - **Primary option leg:** nearest-expiry ATM call and put; the ATM ±2 strike basket is reported alongside to show the result isn't one thin strike.
+  - **Time base:** local arrival time for the primary; exchange-time lag and feed-delay stats reported as a check, labelled experimental until validated on a live capture.
+  - **False-positive floor:** every real event reports a within-event pseudo-shock placebo (5 min before the shock); separate no-news control windows (`capture --placebo-at`) measure the same detector on ordinary days. A lag is only interpretable against that rate.
+  - **Pooling:** descriptive only until n >= 6 events; then percentile-bootstrap CI for the median and an exact sign test, still labelled small-sample.
+- **Also added in the same pass:** a futures control leg (does the spot index lag its own future?), IV series, median-of-last-60s settled level, a stall alarm and undecodable-frame tolerance in the recorder, and a clearly-labelled synthetic demo (`diffusion_cli.py demo`) that exercises the whole stack against injected lags.
+- **Not changed after seeing data:** nothing — there is no real data yet. Any future change to this plan must be logged as a new DEC entry and re-applied to all prior events.
+- **Interview angle:** "I wrote down the analysis plan and the primary metric before the first event, kept the alternatives as sensitivity checks, and built a placebo to measure my detector's false-positive rate" is a much stronger answer to "how do you know it isn't noise?" than a clean number would be.
+
+#decision #methodology #correctness
+
 ---
 
 ## Anticipated pitfalls by phase (pre-seeded — not real bugs yet)
@@ -164,12 +202,76 @@ Same discipline as the sibling project: **not logged bugs** until one actually h
   - `get_ws_authorized_url()`: **confirmed working live** — returned a real, working `wss://` URL. New, previously-undocumented fact worth recording: the actual WS host is `wsfeeder-api.upstox.com` (path `/market-data-feeder/v3/upstox-developer-api/feeds`) — not previously written down anywhere in either project's docs, since the sibling project's own WS work never got a real successful connection confirmed live before now (their ROADMAP.md Phase 4 note: "no tick was received... consistent with NSE being closed").
   - WS `connect()` + `build_subscribe_message()` send: **confirmed working live** — connects cleanly, no rejection.
   - **Not confirmed:** actual tick data. Across all three attempts, exactly one message arrived per connection, each with `FeedResponse.type == market_info` (enum value 2 — `initial_feed`=0 and `live_feed`=1, the ones that would carry real quotes, per `MarketDataFeed.proto`'s own `Type` enum), with an empty `feeds` map. Zero `live_feed` messages, zero real spot or option ticks, in any of the three attempts (bounded windows: ~90s, ~40s, ~20s, run back-to-back in the last ~13 minutes before close).
-- **Root cause: not yet determined, stated honestly rather than guessed at.** Two real, undistinguished possibilities: (1) genuinely thin update activity in the last ~10-15 minutes before close for a `full_d5` depth-mode subscription specifically (plausible but doesn't explain why not even one index LTP tick arrived, since spot index LTP updates are typically frequent even in quiet markets); (2) the subscribe message's format is actually wrong in a way that gets silently accepted (no error) but never actually registers a real subscription — `reference_table.py`'s own docstring already flagged this exact risk as unverified ("best-effort, not independently confirmed against a real successful subscribe"), inherited unchanged from the sibling project's identical caveat.
+- **Root cause (updated 2026-10-05): the subscribe `mode` string was invalid.** Upstox's v3 docs list exactly four valid modes — `ltpc`, `option_greeks`, `full`, `full_d30` — and the code was sending `"full_d5"`. That string is the *protobuf enum name* (`RequestMode.full_d5`, which the server echoes back on decoded messages), not a legal value for the JSON subscribe request; the server accepts it without error and simply never registers a subscription. That fits every symptom: clean connect, clean subscribe, a lone `market_info` housekeeping message per connection, and not even an `initial_feed` snapshot (which a real subscription triggers immediately). It also explains why thin end-of-day trading never explained "not even one index LTP tick".
+  - Original (superseded) hypotheses, 2026-08-26: (1) genuinely thin update activity in the last ~10-15 minutes before close; (2) the subscribe message's format is wrong in a way that gets silently accepted. (2) was right, and it was the *mode value* — not the JSON shape or the binary framing, both of which match the docs.
+  - **Status: RESOLVED, confirmed live 2026-10-06 ~10:07 IST.** `diffusion_cli.py preflight` during NORMAL_OPEN (45s, 738 option legs + 2 futures + 2 indices, mode `full`) received `market_info` x1, `initial_feed` x1, `live_feed` x172 and decoded 8,193 ticks (7,862 option / 277 spot / 54 future), 0 decode errors, 0 stalls. The 2026-08-26 failure (zero live_feed messages) is therefore confirmed to have been the invalid `full_d5` mode.
+  - **Fix:** the default mode is now `"full"`, and `build_subscribe_message()` raises `ValueError` for any mode outside the four valid ones (regression test `test_build_subscribe_message_rejects_full_d5`), so this exact failure can't be silent again.
 - **What this is NOT:** the sibling project's earlier, more benign finding ("no tick because NSE was closed at 11pm") does not apply here — this run happened while NSE was genuinely open, which makes the zero-live-feed result a real, more concerning open question rather than an expected non-result.
-- **Next diagnostic step, not done yet (ran out of market-hours time this session):** re-run with a full-session window (subscribe near market open, not in the last 15 minutes before close) to rule out possibility (1); if still zero `live_feed` messages, try a smaller subscribed instrument count (e.g. 2 indices only, not 662 instruments) and/or a different `mode` value to isolate whether the 662-instrument `full_d5` request itself is the problem.
+- **Verification step:** run `python src/diffusion/diffusion_cli.py preflight` during NORMAL_OPEN. It requires real `live_feed`/`initial_feed` messages that decode into both spot AND option ticks, and prints `PREFLIGHT FAILED` with the specific symptom otherwise. If it still fails with the corrected mode, `--instruments N` isolates whether the 662-instrument request size is the problem.
 - **How you caught it:** didn't stop at "no error was thrown" — built a diagnostic version that logs `FeedResponse.type` and `currentTs` explicitly per message (checked the `.proto` schema for what fields existed rather than guessing), which is what turned an ambiguous "zero rows decoded" result into a precise, actionable one (confirmed protocol-level communication is happening, `market_info` housekeeping messages ARE arriving, but subscription-confirmed live ticks are not).
 - **Interview angle:** a real, in-progress debugging story with an honestly-unresolved root cause — "here's exactly what I confirmed, here's exactly what I didn't, here's the two remaining hypotheses and how I'd distinguish them" is a stronger, more credible answer than a tidier-sounding but incomplete "it works now" would be, and matches this project's own stated discipline of not overclaiming a result the data doesn't actually support yet.
 
-#api-integration #verification #unresolved
+#api-integration #verification #resolved
+
+### [BUG-4] Recorder lost its buffered ticks whenever the connection dropped
+
+- **Phase:** 2
+- **Date found:** 2026-10-05 (code review ahead of the first real capture)
+- **Symptom:** none yet — found by reading, before it could bite on the one real shot at an event.
+- **Root cause:** `_connect_and_record()` buffered up to 19 ticks and only flushed them to SQLite at 20 ticks or after a clean loop exit. A dropped connection raises out of the `async for`, skipping the final flush — so every drop silently discarded the most recent buffered ticks, and the moments around a drop are exactly when a capture is already stressed. The reconnect handler also only caught `ConnectionClosed`/`OSError`, so a handshake failure (`InvalidStatus`) would have ended the whole capture.
+- **Fix:** flush in a `finally` block; also flush on a 1-second timer rather than only a tick count, so a crash loses at most ~1s; the reconnect handler now catches `WebSocketException`.
+- **How you caught it:** reading the loop with "what if it raises here" in mind; regression test `test_buffered_ticks_flushed_when_connection_drops` uses a fake websocket that drops mid-stream.
+- **Interview angle:** a data-loss-on-the-failure-path bug in a pipeline whose whole value is one unrepeatable capture, found by failure-path review rather than by the real event exposing it.
+
+#data-integrity #concurrency
+
+### [BUG-5] A reconnect would have injected a fake post-shock price move
+
+- **Phase:** 2/3
+- **Date found:** 2026-10-05
+- **Symptom:** none yet — reasoned out from the feed protocol.
+- **Root cause:** every successful subscribe makes Upstox send an `initial_feed` message — a snapshot of each instrument's last-known state. On a reconnect mid-window, the recorder stamped that snapshot with the *reconnect arrival time* and stored it like a live tick. Instruments that had not traded would appear to "tick" at the reconnect moment at a stale price, and instruments that moved while disconnected would appear to jump all at once — exactly the signature `detect_first_move()` looks for, unrelated to the shock.
+- **Fix:** reconnects (`attempt > 1`) drop `initial_feed` responses; the first connection keeps its snapshot as a baseline point. Regressions: `test_initial_feed_dropped_on_reconnect_but_kept_on_first_connect`, plus an end-to-end test against a local websocket server that drops the connection mid-stream (`test_diffusion_local_ws_integration.py`).
+- **Interview angle:** reasoning about what the *protocol* does on reconnect, not just whether the code runs — a measurement artifact that would have produced a plausible but wrong lag.
+
+#correctness #data-integrity
+
+### [BUG-6] CPI calendar dates were extrapolated wrong, and future releases were labeled "(released)"
+
+- **Phase:** 1
+- **Date found:** 2026-10-05
+- **Symptom:** the calendar had Sep-2026 CPI on 2026-10-13 and Aug-2026 CPI on 2026-09-12; event names carried a "(released)" suffix even for the not-yet-happened October release; the README said the next CPI was "expected mid-September" while it was already October.
+- **Root cause:** dates were extrapolated from "~12-13 days after month end" (the roadmap's own caveat said to re-verify against MoSPI). MoSPI's published Advance Release Calendar 2026-27 puts CPI on the **12th** of each month, moved to the next working day when that is a weekend/holiday. Aug-2026 data was released Mon 2026-09-14 (the 12th was a Saturday), and Sep-2026 data is due Mon **2026-10-12**, not the 13th.
+- **Fix:** calendar rebuilt from MoSPI's calendar; names no longer claim "(released)"; `timing_confidence="minute"` where the date is MoSPI-published or confirmed by an actual release, `"approximate"` only for 2026-12-14 (Dec 12 is a Saturday and the shift is unconfirmed). Tests assert each date against the 12th-or-next-working-day rule and that no event lands on a weekend.
+- **Interview angle:** the project's own pitfall list warned about exactly this; the honest outcome is that the warning was right and the extrapolated date was off by a day — which, for a gap capture triggered by the clock, is the difference between capturing the release and missing it.
+
+#data-integrity #verification
+
+### [BUG-7] A network outage mid-window would have been reported as a market "first move"
+
+- **Phase:** 2/3
+- **Date found:** 2026-10-06, live, during the first full-length rehearsal (a no-news control capture at 10:30 IST)
+- **Symptom:** the capture lost its connection twice (a keepalive-ping timeout at ~10:20, then at ~10:32 a total loss of DNS/internet that lasted ~10 minutes). The database showed a 576-second hole in NIFTY spot starting ~100s after the control "shock", plus a 29s stall at the start. The recorder itself recovered correctly every time (reconnect, stale snapshot dropped, no data loss before the drop).
+- **Root cause (two parts):**
+  1. *Analysis:* after a hole, the first tick carries all the price change accumulated inside it. Both detectors would flag a "first move" at the reconnect timestamp — a pure data-outage artifact, indistinguishable in the output from a real reaction. With the real event capture possibly hit the same way, this could have produced a confident-looking wrong lag.
+  2. *Recorder:* a silent link death (socket open, nothing arriving) was only noticed when the websocket keepalive timed out (~27s observed), and reconnect backoff reached 30s, so each incident cost more data than necessary.
+- **Fix:** (1) `detect_first_move(max_gap_seconds=...)` reports a breach that first appears right after an outage as **censored** (timestamp `None`, `censored=True`) — "it moved somewhere inside the gap" — rather than timing it at the reconnect; analysis derives the outage threshold per series (>10s and >20x its own median inter-tick time), lists outages as warnings (loudly if one overlaps the shock), marks affected lags `[CENSORED by data outage]`, and excludes censored series from false-positive counts. (2) The recorder now treats 10s of total silence as a dead link and reconnects, pings every 10s, and caps reconnect backoff at 5s.
+- **Also learned from the same run:** the plain one-tick detectors fire often on quiet windows (`returns_c1` fired on 4 of 5 series, `level_c1` on 2 of 4) while the pre-registered 3-tick-confirmed primary fired on 1 of 2 evaluable series — direct evidence for DEC-10's choice of a confirmed primary and for always reporting a false-positive floor. And for options/futures the exchange timestamp is the last *trade* time, so "feed delay" there is trade age, not network latency; only the index timestamp measures feed jitter.
+- **How you caught it:** by running a full-length control capture a day early and then querying the database for gaps, instead of trusting "the capture finished". Regression tests: `test_move_that_first_appears_after_an_outage_is_censored_not_timed`, `test_silent_dead_link_triggers_reconnect_error_quickly`, `test_analysis_flags_outage_at_shock_and_excludes_censored_from_placebo_counts`.
+- **Interview angle:** rehearsal found a failure mode that no synthetic test had — real networks drop — and the fix is a statistical one (censoring), not just a retry loop.
+
+#data-integrity #correctness #verification
+
+### [BUG-8] A colon in an event name silently turned the capture log and charts into hidden NTFS streams
+
+- **Phase:** 4
+- **Date found:** 2026-10-06 (first control-window capture)
+- **Symptom:** after the control capture, `data/logs/` held a visible **0-byte** file `capture_PLACEBO_2026-10-06_10` and `data/diffusion_charts/` a 0-byte `PLACEBO_2026-10-06_10`; the log content and two of three charts were nowhere to be found, and no error was raised.
+- **Root cause:** the placebo event name is `PLACEBO 2026-10-06 10:30 IST`. Filenames were built with `name.replace(' ', '_')` only, leaving `:`. On Windows/NTFS a colon is not rejected: the text after it becomes an *alternate data stream* of a file named for the text before it. (The JSON and one chart had happened to strip colons already, which is why some outputs survived and others didn't — an inconsistent-sanitization bug.)
+- **Fix:** one shared `paths.safe_filename()` (letters, digits, `.`, `_`, `-`; everything else collapses to `_`) used by the log, results and every chart; tests assert no colon can reach a filename. The stray 0-byte files were deleted and the analysis re-run (the database was never affected).
+- **How you caught it:** noticing a 0-byte file with a truncated name in the directory listing, instead of assuming "no error means the files were written".
+- **Interview angle:** a platform-specific failure that raises nothing and drops data quietly; found by checking the outputs exist, not the exit code.
+
+#correctness #tooling
 
 *(Further entries land here as they're actually found.)*

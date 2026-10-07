@@ -1,0 +1,61 @@
+{
+  "event": "RBI MPC Oct 2026",
+  "ticks_recorded": {
+    "option": 885596,
+    "future": 6029,
+    "spot": 25579
+  },
+  "ticks_total": 917204,
+  "moves_points": {
+    "NIFTY 50": {
+      "1 min": 7.5,
+      "5 min": -0.9,
+      "10 min": 13.0,
+      "20 min": 48.6,
+      "30 min": 89.5
+    },
+    "NIFTY futures": {
+      "1 min": 8.6,
+      "5 min": -1.5,
+      "10 min": 12.9,
+      "20 min": 58.2,
+      "30 min": 86.7
+    },
+    "BANK NIFTY": {
+      "1 min": 59.5,
+      "5 min": 13.3,
+      "10 min": 128.9,
+      "20 min": 347.7,
+      "30 min": 459.6
+    }
+  },
+  "moves_percent": {
+    "NIFTY 50": {
+      "1 min": 0.033,
+      "5 min": -0.004,
+      "10 min": 0.057,
+      "20 min": 0.215,
+      "30 min": 0.396
+    },
+    "NIFTY futures": {
+      "1 min": 0.038,
+      "5 min": -0.007,
+      "10 min": 0.057,
+      "20 min": 0.257,
+      "30 min": 0.382
+    },
+    "BANK NIFTY": {
+      "1 min": 0.109,
+      "5 min": 0.024,
+      "10 min": 0.235,
+      "20 min": 0.635,
+      "30 min": 0.839
+    }
+  },
+  "price_before_announcement": {
+    "NIFTY 50": 22609.45,
+    "NIFTY futures": 22661.75,
+    "BANK NIFTY": 54796.55
+  },
+  "window_ist": "09:50-10:30"
+}
